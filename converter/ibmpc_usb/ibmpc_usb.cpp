@@ -29,6 +29,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "hook.h"
 #include "ibmpc.hpp"
 #include "ibmpc_usb.hpp"
+#include "mouse.h"
 
 
 // Converter
@@ -124,9 +125,11 @@ int16_t IBMPCConverter::read_wait(uint16_t wait_ms)
  * Keyboard ID
  *
  * 0000: IBM 84-key keyboard
- * FFFF: XT keyobard
+ * FFFF: No keyboard or XT
  * FFFE: Broken AT or PS/2 keyboard?
  * FFFD: Zenith Z-150 AT
+ * FFFC: IBM XT
+ * FFFB: Clone XT
  * AB83: AT or PS/2 keyboard
  * BFBF: IBM Terminal keyboard
  * 00FF: Mouse
@@ -137,20 +140,25 @@ uint16_t IBMPCConverter::read_keyboard_id(void)
     uint16_t id = 0;
     int16_t  code = 0;
 
-    // temporary fix Z-150 AT should response with ID
+    // Z-150 AT doesn't response to ID commnd at all.
+    // https://deskthority.net/viewtopic.php?p=495196#p495196
     if (ibmpc.protocol == IBMPC_PROTOCOL_AT_Z150) return 0xFFFD;
+
+    // XT doesn't response
+    if (ibmpc.protocol == IBMPC_PROTOCOL_XT_IBM) return 0xFFFC;
+    if (ibmpc.protocol == IBMPC_PROTOCOL_XT_CLONE) return 0xFFFB;
 
     // Disable
     //code = ibmpc_host_send(0xF5);
 
     // Read ID
     code = ibmpc.host_send(0xF2);
-    if (code == -1) { id = 0xFFFF; goto DONE; }     // XT or No keyboard
+    if (code == -1) { id = 0xFFFF; goto DONE; }     // No keyboard or XT
     if (code != 0xFA) { id = 0xFFFE; goto DONE; }   // Broken PS/2?
 
     // ID takes 500ms max TechRef [8] 4-41
     code = read_wait(500);
-    if (code == -1) { id = 0x0000; goto DONE; }     // AT
+    if (code == -1) { id = 0x0000; goto DONE; }     // AT IBM 84-key
     id = (code & 0xFF)<<8;
 
     // Mouse responds with one-byte 00, this returns 00FF [y] p.14
@@ -164,17 +172,34 @@ DONE:
     return id;
 }
 
+static void clear_stuck_keys(void)
+{
+    matrix_clear();
+    clear_keyboard();
+    xprintf("\n[CLR] ");
+}
+
+
 uint8_t IBMPCConverter::process_interface(void)
 {
     if (ibmpc.error) {
         xprintf("\n%u ERR:%02X ISR:%04X ", timer_read(), ibmpc.error, ibmpc.isr_debug);
 
-        // when recv error, neither send error nor buffer full
+        /* Error handling:
+         * IBMPC_ERR_PARITY         Reinit
+         * IBMPC_ERR_PARITY_AA      AT/XT Auto-Switching
+         * IBMPC_ERR_SEND           Ignore
+         * IBMPC_ERR_TIMEOUT        Reinit
+         * IBMPC_ERR_FULL           Ignore
+         * IBMPC_ERR_ILLEGAL        Reinit
+         */
+        // send error and buffer full are ignored   TODO: refactor
         if (!(ibmpc.error & (IBMPC_ERR_SEND | IBMPC_ERR_FULL))) {
-            // keyboard init again
-            if (state == LOOP) {
-                xprintf("[RST] ");
-                state = ERROR;
+            state = ERROR;
+            if (ibmpc.error == IBMPC_ERR_PARITY_AA) {
+                // AT/XT Auto-Switching support
+                // https://github.com/tmk/tmk_keyboard/wiki/IBM-PC-Keyboard-Converter#atxt-auto-switching
+                state = ERROR_PARITY_AA;
             }
         }
 
@@ -205,15 +230,10 @@ uint8_t IBMPCConverter::process_interface(void)
     switch (state) {
         case INIT:
             xprintf("I%u ", timer_read());
-            keyboard_kind = NONE;
-            keyboard_id = 0x0000;
-            current_protocol = 0;
-
-            matrix_clear();
-
             init_time = timer_read();
-            state = WAIT_SETTLE;
+            ibmpc.host_isr_clear();
             ibmpc.host_enable();
+            state = WAIT_SETTLE;
             break;
         case WAIT_SETTLE:
             while (ibmpc.host_recv() != -1) ; // read data
@@ -308,12 +328,16 @@ uint8_t IBMPCConverter::process_interface(void)
 
             if (0x0000 == keyboard_id) {            // CodeSet2 AT(IBM PC AT 84-key)
                 keyboard_kind = PC_AT;
-            } else if (0xFFFF == keyboard_id) {     // CodeSet1 XT
+            } else if (0xFFFF == keyboard_id) {     // No keyboard or XT
                 keyboard_kind = PC_XT;
             } else if (0xFFFE == keyboard_id) {     // CodeSet2 PS/2 fails to response?
                 keyboard_kind = PC_AT;
             } else if (0xFFFD == keyboard_id) {     // Zenith Z-150 AT
                 keyboard_kind = PC_AT;
+            } else if (0xFFFC == keyboard_id) {     // IBM XT
+                keyboard_kind = PC_XT;
+            } else if (0xFFFB == keyboard_id) {     // Clone XT
+                keyboard_kind = PC_XT;
             } else if (0x00FF == keyboard_id) {     // Mouse is not supported
                 keyboard_kind = PC_MOUSE;
             } else if (0xAB85 == keyboard_id || // IBM 122-key Model M, NCD N-97
@@ -331,20 +355,31 @@ uint8_t IBMPCConverter::process_interface(void)
                     keyboard_kind = PC_AT;
                 }
             } else if (0xAB90 == keyboard_id || // IBM 5576-002
-                       0xAB91 == keyboard_id) { // IBM 5576-003
+                       0xAB91 == keyboard_id) { // IBM 5576-003 or Televideo DEC
                 // https://github.com/tmk/tmk_keyboard/wiki/IBM-PC-AT-Keyboard-Protocol#ab90
                 // https://github.com/tmk/tmk_keyboard/wiki/IBM-PC-AT-Keyboard-Protocol#ab91
 
-                xprintf("\n5576_CS82h:");
+                xprintf("\n5576_CS82h: ");
+                keyboard_kind = PC_AT;
                 if ((0xFA == ibmpc.host_send(0xF0)) &&
                     (0xFA == ibmpc.host_send(0x82))) {
                     // switch to code set 82h
                     // https://github.com/tmk/tmk_keyboard/wiki/IBM-PC-AT-Keyboard-Protocol#ibm-5576-scan-codes-set
                     xprintf("OK ");
                 } else {
-                    xprintf("NG ");
+                    xprintf("NG \nTelevideo: ");
+                    if (0xAB91 == keyboard_id) {
+                        // This must be a Televideo DEC keyboard, which piggybacks on the same keyboard_id as IBM 5576-003
+                        // This keyboard normally starts up using code set 1, but we request code set 2 here:
+                        if ((0xFA == ibmpc.host_send(0xF0)) &&
+                            (0xFA == ibmpc.host_send(0x03))) {
+                            xprintf("OK ");
+                            keyboard_kind = PC_TERMINAL;
+                        } else {
+                            xprintf("NG ");
+                        }
+                    }
                 }
-                keyboard_kind = PC_AT;
             } else if (0xBFB0 == keyboard_id) {     // IBM RT Keyboard
                 // https://github.com/tmk/tmk_keyboard/wiki/IBM-PC-AT-Keyboard-Protocol#bfb0
                 // TODO: LED indicator fix
@@ -440,7 +475,7 @@ MOUSE_INTELLI:
                     ibmpc.host_send(0xF3); ibmpc.host_send(0xC8);
                     ibmpc.host_send(0xF3); ibmpc.host_send(0xC8);
                     ibmpc.host_send(0xF3); ibmpc.host_send(0x50);
-                    mouse_id = ((read_keyboard_id() >> 8) == MOUSE_EXPLORER ? MOUSE_EXPLORER : MOUSE_DEFAULT);
+                    mouse_id = ((read_keyboard_id() >> 8) == MOUSE_EXPLORER ? MOUSE_EXPLORER : mouse_id);
 
                     // Not Intellimouse
                     if (mouse_id == 0) {
@@ -468,19 +503,6 @@ MOUSE_DONE:
                 uint16_t code = ibmpc.host_recv();
                 if (code == -1) {
                     // no code
-                    break;
-                }
-
-                // Keyboard Error/Overrun([3]p.26) or Buffer full
-                // Scan Code Set 1: 0xFF
-                // Scan Code Set 2 and 3: 0x00
-                // Buffer full(IBMPC_ERR_FULL): 0xFF
-                if (keyboard_kind != PC_MOUSE && (code == 0x00 || code == 0xFF)) {
-                    // clear stuck keys
-                    matrix_clear();
-                    clear_keyboard();
-
-                    xprintf("\n[CLR] ");
                     break;
                 }
 
@@ -596,7 +618,7 @@ MOUSE_DONE:
                         #endif
                         mouse_report.v = -CHOP8(v);
                         mouse_report.h =  CHOP8(h);
-                        host_mouse_send(&mouse_report);
+                        mouse_send(&mouse_report);
                         xprintf("M[x:%d y:%d v:%d h:%d b:%02X]\n", mouse_report.x, mouse_report.y,
                                 mouse_report.v, mouse_report.h, mouse_report.buttons);
                         break; }
@@ -606,9 +628,22 @@ MOUSE_DONE:
                 }
             }
             break;
+        case ERROR_PARITY_AA:
+            {
+                xprintf("P%u ", timer_read());
+                // AT/XT Auto-Switching support: Send Resend command to select AT
+                uint16_t code = ibmpc.host_send(0xFE);
+                if (0xAA == code) {
+                    state = READ_ID;
+                    break;
+                }
+            }
+            // FALL THROUGH
         case ERROR:
-            // something goes wrong
-            clear_keyboard();
+            xprintf("E%u ", timer_read());
+            // reinit state
+            init();
+            clear_stuck_keys();
             state = INIT;
             break;
         default:
@@ -623,7 +658,7 @@ MOUSE_DONE:
  *
  * See [3], [a]
  *
- * E0-escaped scan codes are translated into unused range of the matrix.(54-7F)
+ * E0-prefixed scan codes are translated into unused range of the matrix.(54-7F)
  *
  *     01-53: Normal codes used in original XT keyboard
  *     54-7F: Not used in original XT keyboard
@@ -634,8 +669,8 @@ MOUSE_DONE:
  *     70  x   *   *   x   *   *   x   *   *   x   *   x   *   x   x   *
  *
  * -: codes existed in original XT keyboard
- * *: E0-escaped codes translated
- * x: Non-espcaped codes(Some are not used in real keyboards probably)
+ * *: E0-prefixed codes translated
+ * x: Non-prefixed codes(Some are not used in real keyboards probably)
  *
  * Codes assigned in range 54-7F:
  *
@@ -700,6 +735,9 @@ int8_t IBMPCConverter::process_cs1(uint8_t code)
     switch (state_cs1) {
         case CS1_INIT:
             switch (code) {
+                case 0xFF:  // Error/Overrun([3]p.26)
+                    clear_stuck_keys();
+                    break;
                 case 0xE0:
                     state_cs1 = CS1_E0;
                     break;
@@ -840,15 +878,24 @@ int8_t IBMPCConverter::process_cs1(uint8_t code)
  */
 uint8_t IBMPCConverter::cs2_e0code(uint8_t code) {
     switch(code) {
-        // E0 prefixed codes translation See [a].
-        case 0x11: return 0x0F; // right alt
-        case 0x14: return 0x17; // right control
-        case 0x1F: return 0x19; // left GUI
+        case 0x11:  if (0xAB90 == keyboard_id || 0xAB91 == keyboard_id)
+                        return 0x13; // Hiragana(5576) -> KANA
+                    else
+                        return 0x0F; // right alt
+
+        case 0x41:  if (0xAB90 == keyboard_id || 0xAB91 == keyboard_id)
+                        return 0x7C; // Keypad ,(5576) -> Keypad *
+                    else
+                        return (code & 0x7F); // unknown
+
+        // standard E0-prefixed codes [a]
+        case 0x14: return 0x19; // right control
+        case 0x1F: return 0x17; // left GUI
         case 0x27: return 0x1F; // right GUI
-        case 0x2F: return 0x5C; // apps
+        case 0x2F: return 0x27; // apps
         case 0x4A: return 0x60; // keypad /
         case 0x5A: return 0x62; // keypad enter
-        case 0x69: return 0x27; // end
+        case 0x69: return 0x5C; // end
         case 0x6B: return 0x53; // cursor left
         case 0x6C: return 0x2F; // home
         case 0x70: return 0x39; // insert
@@ -856,11 +903,11 @@ uint8_t IBMPCConverter::cs2_e0code(uint8_t code) {
         case 0x72: return 0x3F; // cursor down
         case 0x74: return 0x47; // cursor right
         case 0x75: return 0x4F; // cursor up
+        case 0x77: return 0x00; // Unicomp New Model M Pause/Break key fix
         case 0x7A: return 0x56; // page down
         case 0x7D: return 0x5E; // page up
         case 0x7C: return 0x7F; // Print Screen
         case 0x7E: return 0x00; // Control'd Pause
-
         case 0x21: return 0x65; // volume down
         case 0x32: return 0x6E; // volume up
         case 0x23: return 0x6F; // mute
@@ -891,9 +938,52 @@ uint8_t IBMPCConverter::cs2_e0code(uint8_t code) {
         case 0x0D: return 0x19; // LCompose    DEC LK411 -> LGUI
         case 0x79: return 0x6D; // KP-         DEC LK411 -> PCMM
         case 0x83: return 0x28; // F17         DEC LK411
-        default: return (code & 0x7F);
+
+        // https://github.com/tmk/tmk_keyboard/pull/760
+        case 0x00: return 0x65; // TERM FUNC   Siemens F500 -> VOLD
+
+        // Silitek SK-7100P
+        case 0x43: return 0x40; // Close    Silitek SK-7100P -> F20
+        case 0x42: return 0x48; // CD       Silitek SK-7100P -> F21
+        case 0x44: return 0x50; // Video    Silitek SK-7100P -> F22
+        case 0x1C: return 0x30; // U/P      Silitek SK-7100P -> F18
+        case 0x24: return 0x28; // Pause    Silitek SK-7100P -> F17
+        case 0x4B: return 0x57; // Display  Silitek SK-7100P -> F23
+
+        default: return (code & 0x7F); // unknown
     }
 }
+
+#ifdef CS2_80CODE_SUPPORT
+// 80-prefixed codes
+uint8_t IBMPCConverter::cs2_80code(uint8_t code) {
+    // Tandberg TDV 5020
+    // https://github.com/tmk/tmk_keyboard/wiki/IBM-PC-AT-Keyboard-Protocol#tandberg-tdv-5020
+    switch (code) {
+        case 0x2B: return 0x08; // TDV:MERK  (mark)                 -> F13
+        case 0x34: return 0x10; // TDV:ANGRE (undo)                 -> F14
+        case 0x33: return 0x18; // TDV:SKRIV (print)                -> F15
+        case 0x42: return 0x20; // TDV:SLUTT (end)                  -> F16
+        case 0x2C: return 0x28; // TDV:STRYK (cut)                  -> F17
+        case 0x3C: return 0x30; // TDV:KOPI  (copy)                 -> F18
+        case 0x43: return 0x38; // TDV:FLYTT (move)                 -> F19
+        case 0x4B: return 0x40; // TDV:FELT  (cell)                 -> F20
+        case 0x2A: return 0x48; // TDV:AVSN  (paragraph)            -> F21
+        case 0x32: return 0x50; // TDV:SETN  (sentence)             -> F22
+        case 0x3A: return 0x57; // TDV:ORD   (word)                 -> F23
+        case 0x61: return 0x6A; // TDV:⮎     (?)                    -> JYEN Japanese Yen
+        case 0x1D: return 0x5F; // TDV:HJELP (help)                 -> F24
+        case 0x24: return 0x17; // TDV:^^^   (?)                    -> LGUI
+        case 0x44: return 0x65; // TDV:>>/<< (left/right adjust)    -> VOLD Volume Down
+        case 0x4D: return 0x6E; // TDV:JUST  (adjust)               -> VOLU Volume Up
+        case 0x1C: return 0x6F; // TDV:>< <> (center/block)         -> MUTE
+        case 0x2D: return 0x51; // TDV:⇟     (three lines down)     -> RO   Japanese Ro
+        case 0x1B: return 0x1F; // TDV:⇤     (start of line)        -> RGUI
+        case 0x23: return 0x27; // TDV:⇥     (end of line)          -> APP
+    }
+    return code;
+}
+#endif
 
 // IBM 5576-002/003 Scan code translation
 // https://github.com/tmk/tmk_keyboard/wiki/IBM-PC-AT-Keyboard-Protocol#ibm-5576-code-set-82h
@@ -901,20 +991,13 @@ uint8_t IBMPCConverter::translate_5576_cs2(uint8_t code) {
     switch (code) {
         case 0x11: return 0x0F; // Zenmen   -> RALT
         case 0x13: return 0x11; // Kanji    -> LALT
-        case 0x0E: return 0x54; // @
-        case 0x54: return 0x5B; // [
-        case 0x5B: return 0x5D; // ]
-        case 0x5C: return 0x6A; // JYEN
-        case 0x5D: return 0x6A; // JYEN
-        case 0x62: return 0x0E; // Han/Zen  -> `~
-        case 0x7C: return 0x77; // Keypad *
-    }
-    return code;
-}
-uint8_t IBMPCConverter::translate_5576_cs2_e0(uint8_t code) {
-    switch (code) {
-        case 0x11: return 0x13; // Hiragana -> KANA
-        case 0x41: return 0x7C; // Keypad '
+        case 0x0E: return 0x54; // @        -> [
+        case 0x54: return 0x5B; // [        -> ]
+        case 0x5B: return 0x5D; // ]        -> Backslash
+        case 0x5C: return 0x6A; //          -> JPY
+        case 0x5D: return 0x6A; // ￥       -> JPY
+        case 0x62: return 0x0E; // Han/Zen  -> Grave
+        case 0x7C: return 0x77; // Keypad * -> NumLock
     }
     return code;
 }
@@ -927,6 +1010,9 @@ int8_t IBMPCConverter::process_cs2(uint8_t code)
                 code = translate_5576_cs2(code);
             }
             switch (code) {
+                case 0x00:  // Error/Overrun([3]p.26)
+                    clear_stuck_keys();
+                    break;
                 case 0xE0:
                     state_cs2 = CS2_E0;
                     break;
@@ -936,6 +1022,11 @@ int8_t IBMPCConverter::process_cs2(uint8_t code)
                 case 0xE1:
                     state_cs2 = CS2_E1;
                     break;
+#ifdef CS2_80CODE_SUPPORT
+                case 0x80:
+                    state_cs2 = CS2_80;
+                    break;
+#endif
                 case 0x83:  // F7
                     matrix_make(0x02);
                     state_cs2 = CS2_INIT;
@@ -958,10 +1049,7 @@ int8_t IBMPCConverter::process_cs2(uint8_t code)
                     }
             }
             break;
-        case CS2_E0:    // E0-Prefixed
-            if (0xAB90 == keyboard_id || 0xAB91 == keyboard_id) {
-                code = translate_5576_cs2_e0(code);
-            }
+        case CS2_E0:    // E0-prefixed
             switch (code) {
                 case 0x12:  // to be ignored
                 case 0x59:  // to be ignored
@@ -1006,9 +1094,6 @@ int8_t IBMPCConverter::process_cs2(uint8_t code)
             }
             break;
         case CS2_E0_F0: // Break code of E0-prefixed
-            if (0xAB90 == keyboard_id || 0xAB91 == keyboard_id) {
-                code = translate_5576_cs2_e0(code);
-            }
             switch (code) {
                 case 0x12:  // to be ignored
                 case 0x59:  // to be ignored
@@ -1077,6 +1162,25 @@ int8_t IBMPCConverter::process_cs2(uint8_t code)
                     state_cs2 = CS2_INIT;
             }
             break;
+#ifdef CS2_80CODE_SUPPORT
+        case CS2_80:
+            switch (code) {
+                case 0xF0:
+                    state_cs2 = CS2_80_F0;
+                    break;
+                default:
+                    state_cs2 = CS2_INIT;
+                    matrix_make(cs2_80code(code));
+            }
+            break;
+        case CS2_80_F0:
+            switch (code) {
+                default:
+                    state_cs2 = CS2_INIT;
+                    matrix_break(cs2_80code(code));
+            }
+            break;
+#endif
         default:
             state_cs2 = CS2_INIT;
     }
@@ -1103,6 +1207,38 @@ uint8_t IBMPCConverter::translate_5576_cs3(uint8_t code) {
     return code;
 }
 
+// Televideo DEC Scan code translation
+uint8_t IBMPCConverter::translate_televideo_dec_cs3(uint8_t code) {
+    switch (code) {
+        case 0x08: return 0x76; // Esc
+        case 0x8D: return 0x77; // Num Lock
+        case 0x8E: return 0x67; // Numeric Keypad Slash
+        case 0x8F: return 0x7F; // Numeric Keypad Asterisk
+        case 0x90: return 0x7B; // Numeric Keypad Minus
+        case 0x6E: return 0x65; // Insert
+        case 0x65: return 0x6d; // Delete
+        case 0x67: return 0x62; // Home
+        case 0x6d: return 0x64; // End
+        case 0x64: return 0x6e; // PageUp
+        case 0x84: return 0x7c; // Numeric Keypad Plus (Legend says minus)
+        case 0x87: return 0x02; // Print Screen
+        case 0x88: return 0x7e; // Scroll Lock
+        case 0x89: return 0x0c; // Pause
+        case 0x8A: return 0x03; // VOLD
+        case 0x8B: return 0x04; // VOLU
+        case 0x8C: return 0x05; // MUTE
+        case 0x85: return 0x08; // F13
+        case 0x86: return 0x10; // F14
+        case 0x91: return 0x01; // LGUI
+        case 0x92: return 0x09; // RGUI
+        case 0x77: return 0x58; // RCTRL
+        case 0x57: return 0x5C; // Backslash
+        case 0x5C: return 0x53; // Non-US Hash
+        case 0x7c: return 0x68; // Kp Comma
+    }
+    return code;
+}
+
 int8_t IBMPCConverter::process_cs3(uint8_t code)
 {
     switch (code) {
@@ -1120,7 +1256,14 @@ int8_t IBMPCConverter::process_cs3(uint8_t code)
             if (0xAB92 == keyboard_id) {
                 code = translate_5576_cs3(code);
             }
+            if (0xAB91 == keyboard_id) {
+                // This must be the Televideo DEC keyboard. (For 5576-003 we don't use scan code set 3)
+                code = translate_televideo_dec_cs3(code);
+            }
             switch (code) {
+                case 0x00:  // Error/Overrun([3]p.26)
+                    clear_stuck_keys();
+                    break;
                 case 0xF0:
                     state_cs3 = CS3_F0;
                     break;
@@ -1165,6 +1308,10 @@ int8_t IBMPCConverter::process_cs3(uint8_t code)
             state_cs3 = CS3_READY;
             if (0xAB92 == keyboard_id) {
                 code = translate_5576_cs3(code);
+            }
+            if (0xAB91 == keyboard_id) {
+                // This must be the Televideo DEC keyboard. (For 5576-003 we don't use scan code set 3)
+                code = translate_televideo_dec_cs3(code);
             }
             switch (code) {
                 case 0x83:  // PrintScreen

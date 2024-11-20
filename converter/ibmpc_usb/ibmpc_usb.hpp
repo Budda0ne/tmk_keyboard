@@ -4,14 +4,25 @@
 #include <avr/pgmspace.h>
 #include "matrix.h"
 #include "unimap_trans.h"
-#include "ibmpc_usb.h"
 
 
 
-#define ID_STR(id)  (id == 0xFFFE ? "_????" : \
+typedef enum { NONE, PC_XT, PC_AT, PC_TERMINAL, PC_MOUSE } keyboard_kind_t;
+
+#define KEYBOARD_KIND_STR(kind) \
+    (kind == PC_XT ? "XT" :   \
+     kind == PC_AT ? "AT" :   \
+     kind == PC_TERMINAL ? "TERMINAL" :   \
+     kind == PC_MOUSE ? "MOUSE" :   \
+     "NONE")
+
+#define ID_STR(id)  (id == 0xFFFF ? "_NONE" : \
+                    (id == 0xFFFE ? "_ERROR" : \
                     (id == 0xFFFD ? "_Z150" : \
-                    (id == 0x0000 ? "_AT84" : \
-                     "")))
+                    (id == 0xFFFC ? "_IBM" : \
+                    (id == 0xFFFB ? "_CLONE" : \
+                    (id == 0x0000 ? "_IBM84" : \
+                     ""))))))
 
 #define ROW(code)      ((code>>4)&0x07)
 #define COL(code)      (code&0x0F)
@@ -28,6 +39,10 @@ class IBMPCConverter {
     }
 
     void init(void) {
+        keyboard_id = 0x0000;
+        keyboard_kind = NONE;
+        current_protocol = 0;
+        matrix_clear();
         ibmpc.host_init();
     }
 
@@ -64,6 +79,7 @@ class IBMPCConverter {
         SETUP,
         LOOP,
         ERROR,
+        ERROR_PARITY_AA,
     } state = INIT;
 
     enum CS1_state {
@@ -86,6 +102,10 @@ class IBMPCConverter {
         CS2_E1_F0,
         CS2_E1_F0_14,
         CS2_E1_F0_14_F0,
+#ifdef CS2_80CODE_SUPPORT
+        CS2_80,
+        CS2_80_F0,
+#endif
     } state_cs2 = CS2_INIT;
 
     enum CS3_state {
@@ -103,9 +123,13 @@ class IBMPCConverter {
     int8_t process_cs3(uint8_t code);
     uint8_t cs1_e0code(uint8_t code);
     uint8_t cs2_e0code(uint8_t code);
+#ifdef CS2_80CODE_SUPPORT
+    uint8_t cs2_80code(uint8_t code);
+#endif
     uint8_t translate_5576_cs2(uint8_t code);
     uint8_t translate_5576_cs2_e0(uint8_t code);
     uint8_t translate_5576_cs3(uint8_t code);
+    uint8_t translate_televideo_dec_cs3(uint8_t code);
 
     int16_t read_wait(uint16_t wait_ms);
     uint16_t read_keyboard_id(void);
